@@ -1,26 +1,19 @@
 import torch
 import random
 from diffusion.utils.diffusion_process import DiffusionProcess
+from diffusers import DDPMScheduler
 
 class DiffusionDS(torch.utils.data.Dataset):
-    def __init__(self, dataset, diffusion_process:DiffusionProcess):
+    def __init__(self, dataset, num_train_timesteps=1000):
         self.dataset = dataset
-        self.diffusion_process = diffusion_process
+        self.diffusion_process = DDPMScheduler(num_train_timesteps=1000)
 
     def __getitem__(self, idx, t=None):
         x_0, _ = self.dataset[idx]
-        if t is None:
-            # We sample later steps more often
-            c = random.randint(0, 2)
-            if c == 0:
-                t = random.randint(0, self.diffusion_process.T - 1)
-            elif c == 1:
-                t = random.randint(self.diffusion_process.T // 2, self.diffusion_process.T - 1)
-            else:
-                t = random.randint(3 * self.diffusion_process.T // 4, self.diffusion_process.T - 1)
+        epsilon = torch.randn(x_0.shape)
+        timesteps = torch.LongTensor([t])
+        x_t = self.diffusion_process.add_noise(x_0, epsilon, timesteps)
 
-        x_t, epsilon = self.diffusion_process.x_t(x_0, t)
-        # concatenate the sqrt(alpha_tilde_t) and (1- alpha_tilde_t) as additional channels
         return x_t, epsilon, torch.tensor(t).int()
 
     def __len__(self):

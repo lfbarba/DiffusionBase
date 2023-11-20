@@ -11,7 +11,13 @@ from pytorch_base.base_loss import BaseLoss
 from diffusion.models.diffusion_model import UNetDiffusionModel
 from diffusion.datasets.diffusion_dataset import DiffusionDS
 from diffusion.utils.diffusion_process import DiffusionProcess
+
 import random
+
+from diffusers import UNet2DConditionModel
+from diffusers import UNet2DModel
+from diffusers import DDPMScheduler
+from diffusers.optimization import get_cosine_schedule_with_warmup
 
 
 class CIFAR10_Dataset():
@@ -100,12 +106,24 @@ class diffusion_loss(BaseLoss):
 
     def compute_loss(self, instance, model):
         mse = torch.nn.MSELoss()
-        x_t, epsilon, t = instance
-        x_t, epsilon, t = x_t.to(device), epsilon.to(device), t.to(device)
+        x_t, y = instance
+        x_t = x_t.to(device)
+        noise = torch.randn_like(x_t).to(device)
+        bs = x_t.shape[0]
+
+        # Sample a random timestep for each image
+        timesteps = torch.randint(
+            0, noise_scheduler.config.num_train_timesteps, (bs,), device=x_t.device
+        ).long()
+
+        # Add noise to the clean images according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_images = noise_scheduler.add_noise(x_t, noise, timesteps)
+
 
         model.zero_grad()
-        output = model.forward(x_t, t)
-        loss = mse(output, epsilon)
+        noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+        loss = mse(noise_pred, noise)
         return loss, {"loss": loss}
 
 
@@ -137,32 +155,47 @@ if __name__ == '__main__':
     args["seed"] = random.randint(0, 20000) if args["seed"] == -1 else args["seed"]
 
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('mps')
-    device = torch.device('cpu')
+    # device = torch.device('cpu')
+    print(device)
 
-    project_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../chip-project'))
-    model_path = f"{project_path}/checkpoints/diffusion_model_mnist.pt"
+    model_path = f"../../diffusion_model_cifar.pt"
 
-    model = UNetDiffusionModel(
-        image_channels=1,
-        n_channels=64,
-        ch_mults=[1, 2, 2, 4],
-        is_attn=[False, False, False, True],
+    model = UNet2DModel(
+        sample_size=64,  # the target image resolution
+        in_channels=3,  # the number of input channels, 3 for RGB images
+        out_channels=3,  # the number of output channels
+        layers_per_block=2,  # how many ResNet layers to use per UNet block
+        block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
+        down_block_types=(
+            "DownBlock2D",  # a regular ResNet downsampling block
+            "DownBlock2D",
+            "DownBlock2D",
+            "DownBlock2D",
+            "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+            "DownBlock2D",
+        ),
+        up_block_types=(
+            "UpBlock2D",  # a regular ResNet upsampling block
+            "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+            "UpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
+        ),
     ).to(device)
 
     if args['load_checkpoint'] != "":
-        load_model(model, f"{project_path}/checkpoints/{args['load_checkpoint']}")
-
-    dp = DiffusionProcess(T=1000)
+        load_model(model, f"../../{args['load_checkpoint']}")
 
     root_path = "/Users/lfbarba/GitHub/data"
     # root_path = "/myhome/chip-project/data"
-    cifar = MNIST_Dataset(root_path)
-    trainSet = DiffusionDS(cifar.train_dataset, diffusion_process=dp)
-    testSet = DiffusionDS(cifar.test_dataset, diffusion_process=dp)
+    cifar = CIFAR10_Dataset(root_path)
+
+    noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
 
     exp = PyTorchExperiment(
-        train_dataset=trainSet,
-        test_dataset=testSet,
+        train_dataset=cifar.train_dataset,
+        test_dataset=cifar.test_dataset,
         batch_size=args['batch_size'],
         model=model,
         loss_fn=diffusion_loss(),
@@ -174,12 +207,16 @@ if __name__ == '__main__':
         args=args
     )
 
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args['learning_rate'],
-        weight_decay=args['weight_decay'])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args['learning_rate'])
 
-    exp.train(args['epochs'], optimizer, milestones=args['scheduler'], gamma=args['lr_decay'])
+    num_epochs = 50
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=500,
+        num_training_steps=(len(cifar.train_dataset) * num_epochs),
+    )
+
+    exp.train(args['epochs'], optimizer, milestones=args['scheduler'], gamma=args['lr_decay'], scheduler=lr_scheduler)
 
 
 
